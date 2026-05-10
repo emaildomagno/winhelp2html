@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WinHelp para HTML</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="header-inner">
+      <span class="header-icon">📖</span>
+      <div>
+        <h1>WinHelp para HTML</h1>
+        <p class="subtitle">Converta arquivos .hlp do Windows em páginas HTML</p>
+      </div>
+    </div>
+  </header>
+
+  <main class="app-main">
+    <!-- Drop zone -->
+    <section id="drop-zone" class="drop-zone" aria-label="Área de envio de arquivo">
+      <div class="drop-zone-content">
+        <div class="drop-icon">📂</div>
+        <p class="drop-primary">Arraste um arquivo <strong>.hlp</strong> aqui</p>
+        <p class="drop-secondary">ou</p>
+        <label class="btn btn-primary" for="file-input">
+          Selecionar arquivo
+          <input type="file" id="file-input" accept=".hlp" hidden>
+        </label>
+        <p class="drop-hint">Suportado: WinHelp 3.x e 4.x</p>
+      </div>
+    </section>
+
+    <!-- Progress -->
+    <section id="progress-section" class="progress-section hidden">
+      <div class="progress-bar-wrap">
+        <div id="progress-bar" class="progress-bar"></div>
+      </div>
+      <p id="progress-label" class="progress-label">Analisando arquivo…</p>
+    </section>
+
+    <!-- Error -->
+    <section id="error-section" class="error-section hidden">
+      <div class="error-box">
+        <span class="error-icon">⚠️</span>
+        <div>
+          <p id="error-message" class="error-message"></p>
+          <button id="error-retry" class="btn btn-secondary">Tentar novamente</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Result viewer -->
+    <section id="result-section" class="result-section hidden">
+      <div class="result-toolbar">
+        <div class="result-info">
+          <span id="result-title" class="result-title"></span>
+          <span id="result-count" class="result-count"></span>
+        </div>
+        <div class="result-actions">
+          <button id="btn-download-all" class="btn btn-primary">⬇ Baixar ZIP</button>
+          <button id="btn-reset" class="btn btn-secondary">Novo arquivo</button>
+        </div>
+      </div>
+
+      <div class="result-layout">
+        <!-- Sidebar: topic list -->
+        <nav class="topic-nav" id="topic-nav" aria-label="Tópicos">
+          <div class="nav-search-wrap">
+            <input type="search" id="nav-search" class="nav-search" placeholder="Buscar tópico…" aria-label="Buscar tópico">
+          </div>
+          <ul id="topic-list" class="topic-list"></ul>
+        </nav>
+
+        <!-- Content panel -->
+        <div class="content-panel">
+          <div class="content-header">
+            <h2 id="content-title" class="content-title">Selecione um tópico</h2>
+            <button id="btn-download-topic" class="btn btn-sm btn-secondary hidden">⬇ Baixar tópico</button>
+          </div>
+          <div id="content-body" class="content-body">
+            <div class="placeholder-msg">
+              <span>👈</span>
+              <p>Escolha um tópico na barra lateral para visualizá-lo.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="app-footer">
+    <p>WinHelp → HTML &bull; código aberto</p>
+  </footer>
+
+  <script src="js/hlp-parser.js"></script>
+  <script src="js/hlp-renderer.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
