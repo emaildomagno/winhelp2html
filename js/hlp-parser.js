@@ -325,53 +325,87 @@ function parsePhrases(r) {
 }
 
 /* ─────────────────────────────────────────────
-   Topic text decoder
+   Topic extraction from |TOPIC data
 
-   WinHelp topic data is stored in 4 KB blocks.  Each block:
-     i32 nextBlockOffset   (-1 = last block)
-     i32 unused
-     byte[] records…
+   |TOPIC is divided into fixed-size file-blocks (2 048 or 4 096 bytes).
+   Each file-block starts with an 8-byte block header:
+     i32 nextBlockOffset  (abs. offset in |TOPIC of next block, -1 = last)
+     i32 lastTopicOffset  (informational)
 
-   Record types:
-     0x01 = TopicHeader  — begins a new logical topic (16-byte payload)
-     0x20 = TextRecord   — paragraph data
-     0x00 = padding (skip to next block)
+   Within each block, "topic links" are stored sequentially.
+   Each topic link has a 24-byte link header:
+     i32 linkSize   total bytes of this link (24-byte hdr + payload)
+     i32 dataLen    bytes of payload following this 24-byte header
+     i32 prevLink   abs. offset of previous link  (-1 = none)
+     i32 nextLink   abs. offset of next link      (-1 = none)
+     i32 prevNS     non-scroll navigation (ignored)
+     i32 nextNS
 
-   TextRecord layout:
-     u16 blockSize   (bytes for this record, including these 4 bytes)
-     u16 dataSize    (bytes of attribute data immediately following)
-     byte[dataSize]  paragraph attributes (we mostly skip these)
-     byte[…]         text bytes, possibly phrase-compressed
+   Payload (dataLen bytes):
+     byte[0] recType  0x02 = new logical topic
+                      0x20 = text paragraph
+                      0x23 = table
+     byte[1…] paragraph data
 ───────────────────────────────────────────── */
-const TOPIC_BLOCK = 4096;
 
-function decodeText(bytes, phrases) {
+const LINK_HDR  = 24;   // bytes in each topic link header
+const BLOCK_HDR = 8;    // bytes in each file-block header
+
+/* Detect file-block size from the first nextBlock field.
+   Typical values: 2048 (WinHelp 3.x) or 4096 (WinHelp 4.x). */
+function detectBlockSize(buf) {
+  if (buf.byteLength < 4) return 4096;
+  const v = new DataView(buf).getInt32(0, true);
+  if (v === 2048) return 2048;
+  if (v === 4096) return 4096;
+  return 4096;
+}
+
+/* Extract printable text from a paragraph payload.
+   Bytes 0x20-0x7F → literal ASCII.
+   Bytes 0x80-0xFF → phrase table lookup.
+   Bytes 0x00-0x1F → WinHelp formatting escape codes; skip them and
+                     any parameter bytes they carry.                  */
+function extractParaText(buf, start, end, phrases) {
+  const view = new DataView(buf);
   let text = '';
-  let i    = 0;
+  let i    = start;
 
-  while (i < bytes.length) {
-    const b = bytes[i++];
+  while (i < end) {
+    const b = view.getUint8(i++);
+
     if (b === 0x00) break;
 
-    if (b < 0x20) {
-      if (b === 0x0D) { text += '\n'; }
-      continue;
-    }
-
-    if (b < 0x80) {
+    if (b >= 0x20 && b < 0x80) {
       text += String.fromCharCode(b);
       continue;
     }
 
-    /* Phrase reference: index encoded across one or two bytes */
-    if (phrases.length === 0) continue;
-    let idx = (b - 0x80) << 1;
-    if (i < bytes.length && (bytes[i] & 1)) {
-      idx |= 1;
-      i++;
+    if (b >= 0x80) {
+      if (phrases.length === 0) continue;
+      let idx = (b - 0x80) << 1;
+      if (i < end && (view.getUint8(i) & 1)) { idx |= 1; i++; }
+      idx >>= 1;
+      if (idx < phrases.length) text += phrases[idx];
+      continue;
     }
-    idx >>= 1;
-    if (idx < phrases.length) text += phrases[idx];
+
+    /* b < 0x20 — WinHelp escape codes with variable-length parameters */
+    switch (b) {
+      case 0x0D: text += '\n'; break;
+      case 0x0A: break;
+      /* 1-byte parameter codes (even values) */
+      case 0x02: case 0x04: case 0x06: case 0x08:
+      case 0x0E: case 0x10: case 0x12: case 0x14:
+      case 0x16: case 0x18: case 0x1A: case 0x1C: i += 1; break;
+      /* 2-byte parameter codes (odd values) */
+      case 0x03: case 0x05: case 0x07: case 0x09:
+      case 0x0F: case 0x11: case 0x13: case 0x15:
+      case 0x17: case 0x19: case 0x1B: case 0x1D: i += 2; break;
+      /* 4-byte parameter */
+      case 0x01: i += 4; break;
+      default: break;
+    }
   }
   return text;
 }
@@ -380,96 +414,69 @@ function extractTopics(topicBuf, phrases, onProgress) {
   const topics  = [];
   const size    = topicBuf.byteLength;
   const view    = new DataView(topicBuf);
-  let   pos     = 0;
   let   topicNo = 0;
 
-  function currentTopic() {
-    if (topics.length === 0) {
-      topics.push({ title: '', paras: [], index: topicNo++ });
-    }
-    return topics[topics.length - 1];
-  }
+  const fileBlockSize = detectBlockSize(topicBuf);
+  const visited       = new Set();
+  let   blockStart    = 0;
 
-  while (pos + 8 <= size) {
-    const nextBlock = view.getInt32(pos, true);     // next block offset
-    const blockUsed = view.getInt32(pos + 4, true); // bytes used (may be 0)
+  while (blockStart < size && !visited.has(blockStart)) {
+    visited.add(blockStart);
+    if (blockStart + BLOCK_HDR > size) break;
 
-    const blockEnd = Math.min(pos + TOPIC_BLOCK, size);
-    let   rPos     = pos + 8;
+    const nextBlockOff = view.getInt32(blockStart, true);
+    /* lastTopicOff unused */
 
-    while (rPos < blockEnd) {
-      if (rPos >= size) break;
-      const recType = view.getUint8(rPos++);
+    const blockDataEnd = Math.min(blockStart + fileBlockSize, size);
+    let   lpos         = blockStart + BLOCK_HDR;
 
-      if (recType === 0x00) {
-        break; // padding, skip to next block
+    while (lpos + LINK_HDR <= blockDataEnd) {
+      const linkSize = view.getInt32(lpos,     true);
+      const dataLen  = view.getInt32(lpos + 4, true);
+      /* prevLink, nextLink, prevNS, nextNS at bytes 8-23 — not needed */
+
+      if (linkSize < LINK_HDR || linkSize > fileBlockSize ||
+          dataLen  < 1        || dataLen  > linkSize - LINK_HDR) {
+        break;
       }
 
-      if (recType === 0x01) {
-        /* TopicHeader: 16 bytes of metadata we skip */
-        if (rPos + 16 > blockEnd) break;
-        rPos += 16;
+      const dataStart = lpos + LINK_HDR;
+      if (dataStart >= size) break;
+
+      const dataEnd  = Math.min(dataStart + dataLen, blockDataEnd, size);
+      const recType  = view.getUint8(dataStart);
+
+      if (recType === 0x01 || recType === 0x02) {
         topics.push({ title: '', paras: [], index: topicNo++ });
-        continue;
-      }
 
-      if (recType === 0x20) {
-        /* TextRecord */
-        if (rPos + 4 > blockEnd) break;
-
-        const blockSize = view.getUint16(rPos,     true);
-        const dataSize  = view.getUint16(rPos + 2, true);
-        rPos += 4;
-
-        if (blockSize < 4) break;
-        const payloadSize = blockSize - 4;
-
-        if (rPos + payloadSize > blockEnd) break;
-
-        /* Attribute bytes (paragraph formatting) */
-        const attrEnd  = rPos + dataSize;
-        /* Text bytes follow the attribute block */
-        const textEnd  = rPos + payloadSize;
-
-        if (attrEnd <= textEnd) {
-          const textLen   = textEnd - attrEnd;
-          const textBytes = new Uint8Array(topicBuf, attrEnd, textLen);
-          const text      = decodeText(textBytes, phrases).trim();
-
-          if (text) {
-            const t = currentTopic();
-            if (!t.title) t.title = text.split('\n')[0].substring(0, 120);
-            t.paras.push(text);
-          }
+      } else if (recType === 0x20) {
+        const text = extractParaText(topicBuf, dataStart + 1, dataEnd, phrases).trim();
+        if (text) {
+          if (!topics.length) topics.push({ title: '', paras: [], index: topicNo++ });
+          const t = topics[topics.length - 1];
+          if (!t.title) t.title = text.split('\n')[0].substring(0, 120);
+          t.paras.push(text);
         }
-
-        rPos = textEnd;
-        continue;
       }
+      /* 0x23 / 0x24 = table records: skip silently */
 
-      /* Unknown record type — try to skip by reading blockSize */
-      if (rPos + 2 <= blockEnd) {
-        const skip = view.getUint16(rPos, true);
-        if (skip >= 2 && rPos + skip <= blockEnd) { rPos += skip; continue; }
-      }
-      break;
+      lpos += linkSize;
     }
 
-    /* Advance to next block */
-    if (nextBlock > pos && nextBlock < size) {
-      pos = nextBlock;
+    if (nextBlockOff > blockStart && nextBlockOff < size) {
+      blockStart = nextBlockOff;
     } else {
-      pos += TOPIC_BLOCK;
+      blockStart += fileBlockSize;
     }
 
-    if (topics.length % 20 === 0 && topics.length > 0) {
+    if (topics.length > 0 && topics.length % 20 === 0) {
       onProgress(55 + Math.min(35, topics.length / 4),
         `${topics.length} tópicos encontrados…`);
     }
   }
 
   return topics
-    .filter(t => t.title || t.paras.length > 0)
+    .filter(t => t.title || t.paras.length)
     .map((t, i) => ({
       title: t.title || `Tópico ${i + 1}`,
       text:  t.paras.join('\n\n'),
