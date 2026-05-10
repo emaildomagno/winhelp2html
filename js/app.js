@@ -228,6 +228,7 @@ function resetApp() {
   </div>`;
   contentTitle.textContent = 'Selecione um tópico';
   btnDownloadTopic.classList.add('hidden');
+  if (typeof DebugLog !== 'undefined') DebugLog.clear();
   showOnly(dropZone);
 }
 

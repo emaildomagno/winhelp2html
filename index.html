@@ -51,6 +51,18 @@
       </div>
     </section>
 
+    <!-- Debug log panel (always rendered, shown after a parse attempt) -->
+    <section id="debug-section" class="debug-section hidden">
+      <details id="debug-details">
+        <summary class="debug-summary">
+          <span class="debug-title">Log de diagnóstico</span>
+          <span id="debug-badge" class="debug-badge">0 entradas</span>
+          <button id="btn-copy-log" class="btn btn-sm btn-secondary" title="Copiar log">📋 Copiar</button>
+        </summary>
+        <pre id="debug-log" class="debug-log"></pre>
+      </details>
+    </section>
+
     <!-- Result viewer -->
     <section id="result-section" class="result-section hidden">
       <div class="result-toolbar">
@@ -94,6 +106,7 @@
     <p>WinHelp → HTML &bull; código aberto</p>
   </footer>
 
+  <script src="js/debug-log.js"></script>
   <script src="js/hlp-parser.js"></script>
   <script src="js/hlp-renderer.js"></script>
   <script src="js/app.js"></script>

@@ -411,57 +411,97 @@ function extractParaText(buf, start, end, phrases) {
 }
 
 function extractTopics(topicBuf, phrases, onProgress) {
+  const L = typeof DebugLog !== 'undefined' ? DebugLog : null;
   const topics  = [];
   const size    = topicBuf.byteLength;
   const view    = new DataView(topicBuf);
   let   topicNo = 0;
 
   const fileBlockSize = detectBlockSize(topicBuf);
-  const visited       = new Set();
-  let   blockStart    = 0;
+  L?.head(`── |TOPIC extraction ──`);
+  L?.info(`  Tamanho do buffer: ${size} bytes`);
+  L?.info(`  Tamanho de bloco detectado: ${fileBlockSize} bytes`);
+  L?.info(`  Frases carregadas: ${phrases.length}`);
+  if (L) L.hex('  Primeiros 64 bytes de |TOPIC', topicBuf, 0, 64);
+
+  const visited    = new Set();
+  let   blockStart = 0;
+  let   blockNo    = 0;
+  let   totalLinks = 0;
+  let   skipped    = 0;
 
   while (blockStart < size && !visited.has(blockStart)) {
     visited.add(blockStart);
-    if (blockStart + BLOCK_HDR > size) break;
+    if (blockStart + BLOCK_HDR > size) {
+      L?.warn(`  Bloco #${blockNo} em offset ${blockStart}: fora dos limites — interrompendo`);
+      break;
+    }
 
-    const nextBlockOff = view.getInt32(blockStart, true);
-    /* lastTopicOff unused */
+    const nextBlockOff  = view.getInt32(blockStart,     true);
+    const lastTopicOff  = view.getInt32(blockStart + 4, true);
+
+    L?.info(`  Bloco #${blockNo} offset=${blockStart}  nextBlock=${nextBlockOff}  lastTopic=${lastTopicOff}`);
 
     const blockDataEnd = Math.min(blockStart + fileBlockSize, size);
     let   lpos         = blockStart + BLOCK_HDR;
+    let   linksInBlock = 0;
 
     while (lpos + LINK_HDR <= blockDataEnd) {
       const linkSize = view.getInt32(lpos,     true);
       const dataLen  = view.getInt32(lpos + 4, true);
-      /* prevLink, nextLink, prevNS, nextNS at bytes 8-23 — not needed */
+      const prevLink = view.getInt32(lpos + 8, true);
+      const nextLink = view.getInt32(lpos + 12, true);
+
+      L?.dim(`    link @${lpos}  linkSize=${linkSize}  dataLen=${dataLen}  prev=${prevLink}  next=${nextLink}`);
 
       if (linkSize < LINK_HDR || linkSize > fileBlockSize ||
           dataLen  < 1        || dataLen  > linkSize - LINK_HDR) {
+        L?.warn(`    → inválido (linkSize=${linkSize}, dataLen=${dataLen}, LINK_HDR=${LINK_HDR}, fileBlockSize=${fileBlockSize}) — interrompendo bloco`);
+        skipped++;
         break;
       }
 
       const dataStart = lpos + LINK_HDR;
-      if (dataStart >= size) break;
+      if (dataStart >= size) { L?.warn(`    → dataStart ${dataStart} >= size ${size}`); break; }
 
       const dataEnd  = Math.min(dataStart + dataLen, blockDataEnd, size);
       const recType  = view.getUint8(dataStart);
 
+      L?.dim(`    recType=0x${recType.toString(16).padStart(2,'0')}  dataStart=${dataStart}  dataEnd=${dataEnd}`);
+
       if (recType === 0x01 || recType === 0x02) {
         topics.push({ title: '', paras: [], index: topicNo++ });
+        L?.ok(`    → NOVO TÓPICO #${topicNo} (type=0x${recType.toString(16)})`);
 
       } else if (recType === 0x20) {
         const text = extractParaText(topicBuf, dataStart + 1, dataEnd, phrases).trim();
+        L?.dim(`    → TEXT len=${dataEnd - dataStart - 1}  extraído="${text.substring(0, 60).replace(/\n/g,' ')}"`);
         if (text) {
           if (!topics.length) topics.push({ title: '', paras: [], index: topicNo++ });
           const t = topics[topics.length - 1];
-          if (!t.title) t.title = text.split('\n')[0].substring(0, 120);
+          if (!t.title) {
+            t.title = text.split('\n')[0].substring(0, 120);
+            L?.ok(`    → Título do tópico #${t.index + 1}: "${t.title}"`);
+          }
           t.paras.push(text);
+        } else {
+          L?.dim(`    → texto vazio após extração`);
         }
+
+      } else if (recType === 0x23 || recType === 0x24) {
+        L?.dim(`    → TABELA (type=0x${recType.toString(16)}) — ignorado`);
+
+      } else {
+        L?.warn(`    → tipo desconhecido 0x${recType.toString(16).padStart(2,'0')}`);
       }
-      /* 0x23 / 0x24 = table records: skip silently */
 
       lpos += linkSize;
+      linksInBlock++;
+      totalLinks++;
     }
+
+    L?.info(`  Bloco #${blockNo} encerrado: ${linksInBlock} links, ${topics.length} tópicos até aqui`);
+    blockNo++;
 
     if (nextBlockOff > blockStart && nextBlockOff < size) {
       blockStart = nextBlockOff;
@@ -475,13 +515,18 @@ function extractTopics(topicBuf, phrases, onProgress) {
     }
   }
 
-  return topics
+  L?.head(`── Resultado: ${topics.length} tópicos, ${totalLinks} links, ${skipped} blocos inválidos ──`);
+
+  const result = topics
     .filter(t => t.title || t.paras.length)
     .map((t, i) => ({
       title: t.title || `Tópico ${i + 1}`,
       text:  t.paras.join('\n\n'),
       index: i,
     }));
+
+  L?.info(`  Após filtro: ${result.length} tópicos com conteúdo`);
+  return result;
 }
 
 /* ─────────────────────────────────────────────
@@ -518,44 +563,63 @@ function fallbackScanFiles(reader) {
    Main parser entry point
 ───────────────────────────────────────────── */
 function parseHLP(arrayBuffer, onProgress) {
+  const L = typeof DebugLog !== 'undefined' ? DebugLog : null;
   const r = new DataReader(arrayBuffer);
+
+  L?.head('═══════════════ parseHLP iniciado ═══════════════');
+  L?.info(`Tamanho do arquivo: ${arrayBuffer.byteLength} bytes`);
+  if (L) L.hex('Primeiros 16 bytes', arrayBuffer, 0, 16);
 
   /* ── File header ── */
   if (r.size < 16) throw new Error('Arquivo muito pequeno para ser um HLP válido.');
 
   const magic = r.u32();
+  L?.info(`Magic: 0x${magic.toString(16).toUpperCase()}`);
 
   /* Accept both 3.x (0x00035F3F) and 4.x (0x00045F3F) magic */
   if ((magic & 0x0000FFFF) !== 0x5F3F) {
+    L?.error(`Magic inválido — esperado 0xXXXX5F3F`);
     throw new Error(
       `Arquivo inválido: os primeiros bytes não correspondem ao formato WinHelp ` +
       `(encontrado: 0x${magic.toString(16).toUpperCase()}).`
     );
   }
+  L?.ok(`Magic OK (versão ${(magic >> 16) & 0xFF === 3 ? '3.x' : (magic >> 16) & 0xFF === 4 ? '4.x' : 'desconhecida'})`);
 
   onProgress(10, 'Lendo cabeçalho…');
 
   const directoryStart = r.i32();
-  const freeListStart  = r.i32(); // eslint-disable-line no-unused-vars
-  const fileSize       = r.i32(); // eslint-disable-line no-unused-vars
+  const freeListStart  = r.i32();
+  const fileSize       = r.i32();
+
+  L?.info(`directoryStart: ${directoryStart}  freeListStart: ${freeListStart}  fileSize: ${fileSize}`);
 
   if (directoryStart <= 0 || directoryStart >= r.size) {
+    L?.error(`directoryStart inválido: ${directoryStart}`);
     throw new Error('Offset de diretório inválido no cabeçalho do arquivo.');
   }
 
   /* ── B+ tree directory ── */
   onProgress(20, 'Lendo diretório interno…');
+  L?.head('── B+ Tree ──');
+  if (L) L.hex(`Bytes em directoryStart (${directoryStart})`, arrayBuffer, directoryStart, 40);
 
   let fileMap = {};
 
   try {
     const tree = new BTreeReader(r, directoryStart);
+    L?.ok(`B+ tree: magic OK  pageSize=${tree.pageSize}  rootPage=${tree.rootPage}  nLevels=${tree.nLevels}  totalEntries=${tree.totalEntries}  pagesOffset=${tree.pagesOffset}`);
     const list = tree.listFiles();
-    for (const f of list) fileMap[f.name] = f.fileOffset;
+    L?.ok(`Arquivos encontrados no diretório: ${list.length}`);
+    for (const f of list) {
+      fileMap[f.name] = f.fileOffset;
+      L?.dim(`  "${f.name}" → offset ${f.fileOffset}`);
+    }
   } catch (e) {
-    /* B+ tree failed — try brute-force name scan as last resort */
+    L?.warn(`B+ tree falhou: ${e.message} — tentando varredura alternativa`);
     onProgress(25, 'Tentando varredura alternativa de arquivos…');
     fileMap = fallbackScanFiles(r);
+    L?.info(`Varredura alternativa encontrou: ${Object.keys(fileMap).join(', ') || '(nada)'}`);
 
     if (Object.keys(fileMap).length === 0) {
       throw new Error(
@@ -566,46 +630,74 @@ function parseHLP(arrayBuffer, onProgress) {
   }
 
   onProgress(35, 'Lendo metadados…');
+  L?.head('── Arquivos internos ──');
 
   /* ── |SYSTEM ── */
   let sysInfo = { title: '', version: 0 };
   if (fileMap['|SYSTEM'] != null) {
-    try { sysInfo = parseSystem(readInternalFile(r, fileMap['|SYSTEM'])); }
-    catch (_) { /* non-fatal */ }
+    L?.info(`|SYSTEM offset: ${fileMap['|SYSTEM']}`);
+    if (L) L.hex('|SYSTEM header bytes', arrayBuffer, fileMap['|SYSTEM'], 16);
+    try {
+      sysInfo = parseSystem(readInternalFile(r, fileMap['|SYSTEM']));
+      L?.ok(`|SYSTEM: magic=0x${sysInfo.magic?.toString(16)}  version=${sysInfo.version}  title="${sysInfo.title}"`);
+    } catch (e) { L?.warn(`|SYSTEM falhou: ${e.message}`); }
+  } else {
+    L?.warn('|SYSTEM não encontrado no diretório');
   }
 
   /* ── |Phrases ── */
   onProgress(45, 'Lendo tabela de frases…');
   let phrases = [];
   if (fileMap['|Phrases'] != null) {
-    try { phrases = parsePhrases(readInternalFile(r, fileMap['|Phrases'])); }
-    catch (_) { /* non-fatal */ }
+    L?.info(`|Phrases offset: ${fileMap['|Phrases']}`);
+    try {
+      phrases = parsePhrases(readInternalFile(r, fileMap['|Phrases']));
+      L?.ok(`|Phrases: ${phrases.length} frases carregadas`);
+    } catch (e) { L?.warn(`|Phrases falhou: ${e.message}`); }
+  } else {
+    L?.info('|Phrases não encontrado (compressão de frases desabilitada)');
   }
 
   /* ── |TOPIC ── */
   onProgress(55, 'Decodificando tópicos…');
+  L?.head('── |TOPIC ──');
 
   let topics = [];
 
   if (fileMap['|TOPIC'] != null) {
+    const topicOff = fileMap['|TOPIC'];
+    L?.info(`|TOPIC offset no arquivo: ${topicOff}`);
+    if (L) L.hex('|TOPIC cabeçalho interno (16 bytes)', arrayBuffer, topicOff, 16);
+
     try {
-      const topicOff = fileMap['|TOPIC'];
       r.seek(topicOff);
-      const _res  = r.i32();
-      const tSize = r.i32();
+      const hdrWord0 = r.i32();
+      const hdrWord1 = r.i32();
+      L?.info(`|TOPIC header word0=${hdrWord0}  word1=${hdrWord1}`);
 
       const safeSize = Math.min(
-        tSize > 0 ? tSize : r.size - topicOff - 8,
+        hdrWord1 > 0 ? hdrWord1 : r.size - topicOff - 8,
         r.size - topicOff - 8
       );
-      const topicBuf = arrayBuffer.slice(topicOff + 8, topicOff + 8 + safeSize);
-      topics = extractTopics(topicBuf, phrases, onProgress);
+      L?.info(`|TOPIC safeSize=${safeSize} bytes  (dados começam em offset ${topicOff + 8})`);
+
+      if (safeSize <= 0) {
+        L?.error('|TOPIC safeSize <= 0 — nada a decodificar');
+      } else {
+        if (L) L.hex('|TOPIC primeiros 64 bytes de dados', arrayBuffer, topicOff + 8, 64);
+        const topicBuf = arrayBuffer.slice(topicOff + 8, topicOff + 8 + safeSize);
+        topics = extractTopics(topicBuf, phrases, onProgress);
+      }
     } catch (e) {
+      L?.error(`Exceção em |TOPIC: ${e.message}`);
       topics = [{ title: 'Erro ao decodificar tópicos', text: e.message, index: 0 }];
     }
+  } else {
+    L?.error('|TOPIC não encontrado no diretório — sem tópicos');
   }
 
   if (topics.length === 0) {
+    L?.warn('Nenhum tópico extraído — retornando placeholder');
     topics = [{
       title: '(Sem tópicos)',
       text:  'Nenhum tópico legível foi encontrado neste arquivo.',
@@ -614,6 +706,7 @@ function parseHLP(arrayBuffer, onProgress) {
   }
 
   onProgress(95, 'Finalizando…');
+  L?.head(`═══════════════ parseHLP concluído: ${topics.length} tópico(s) ═══════════════`);
 
   return {
     title:    sysInfo.title || 'Sem título',
