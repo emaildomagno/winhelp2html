@@ -296,6 +296,90 @@ function readFixedStr(r, maxLen) {
 }
 
 /* ─────────────────────────────────────────────
+   WinHelp 3.x phrase table  |PhrIndex + |PhrImage
+
+   |PhrIndex layout:
+     u16 nPhrases
+     u16 cbPhrases  (total bytes in decompressed |PhrImage)
+     u16 offsets[nPhrases + 1]
+
+   |PhrImage layout:
+     Hall-LZ77–compressed blob whose decompressed form is
+     the concatenated phrase strings addressed by offsets[].
+───────────────────────────────────────────── */
+function parsePhrIndex3x(r) {
+  if (r.remaining < 4) return null;
+  const nPhrases  = r.u16();
+  const cbPhrases = r.u16(); // eslint-disable-line no-unused-vars
+  if (nPhrases === 0 || nPhrases > 32000) return null;
+  const offsets = [];
+  for (let i = 0; i <= nPhrases; i++) {
+    if (r.remaining < 2) return null;
+    offsets.push(r.u16());
+  }
+  return { nPhrases, offsets };
+}
+
+function parsePhrImage3x(r, phrIndex) {
+  const compressed = new Uint8Array(r.buffer);
+  const raw        = lzDecompress(compressed);
+  const phrases    = [];
+  for (let i = 0; i < phrIndex.nPhrases; i++) {
+    const start = phrIndex.offsets[i];
+    const end   = phrIndex.offsets[i + 1];
+    if (start >= raw.length || end > raw.length || end <= start) {
+      phrases.push(''); continue;
+    }
+    let s = '';
+    for (let j = start; j < end; j++) s += String.fromCharCode(raw[j]);
+    phrases.push(s);
+  }
+  return phrases;
+}
+
+/* ─────────────────────────────────────────────
+   WinHelp 3.x |TOPIC block decompression
+
+   Each 2048-byte block has a 10-byte uncompressed header:
+     i32 nextBlock, i32 lastTopicLink, u16 freeBytes
+   Followed by Hall-LZ77–compressed data of length
+   (2048 - 10 - freeBytes).  After decompressing every
+   block and concatenating results we get a flat stream
+   of topic-link records with no block boundaries.
+───────────────────────────────────────────── */
+function decompressTopicBlocks3x(topicBuf, L) {
+  const BLOCK_3X     = 2048;
+  const BLK_HDR_3X   = 10;
+  const view         = new DataView(topicBuf);
+  const allBytes     = [];
+  let   blockStart   = 0;
+  let   blockNo      = 0;
+
+  while (blockStart + BLK_HDR_3X <= topicBuf.byteLength) {
+    const nextBlock  = view.getInt32(blockStart,     true);
+    const freeBytes  = view.getUint16(blockStart + 8, true);
+    const blockEnd   = Math.min(blockStart + BLOCK_3X, topicBuf.byteLength);
+    const compStart  = blockStart + BLK_HDR_3X;
+    const safeEnd    = blockEnd - Math.min(freeBytes, blockEnd - compStart);
+
+    L?.dim(`  3x bloco #${blockNo} off=${blockStart} nextBlock=${nextBlock} freeBytes=${freeBytes} compLen=${safeEnd - compStart}`);
+
+    if (safeEnd > compStart) {
+      const compData = new Uint8Array(topicBuf, compStart, safeEnd - compStart);
+      const expanded = lzDecompress(compData);
+      L?.dim(`  → ${compData.length} → ${expanded.length} bytes`);
+      for (const b of expanded) allBytes.push(b);
+    }
+
+    blockStart += BLOCK_3X;
+    blockNo++;
+  }
+
+  L?.info(`  Descompressão 3.x total: ${topicBuf.byteLength} → ${allBytes.length} bytes`);
+  return new Uint8Array(allBytes).buffer;
+}
+
+/* ─────────────────────────────────────────────
    |Phrases decompression table
 ───────────────────────────────────────────── */
 function parsePhrases(r) {
@@ -410,19 +494,22 @@ function extractParaText(buf, start, end, phrases) {
   return text;
 }
 
-function extractTopics(topicBuf, phrases, onProgress) {
+/* flatMode = true: the buffer is already fully decompressed with no block
+   headers — treat the whole thing as a single stream of topic-link records. */
+function extractTopics(topicBuf, phrases, onProgress, flatMode) {
   const L = typeof DebugLog !== 'undefined' ? DebugLog : null;
   const topics  = [];
   const size    = topicBuf.byteLength;
   const view    = new DataView(topicBuf);
   let   topicNo = 0;
 
-  const fileBlockSize = detectBlockSize(topicBuf);
-  L?.head(`── |TOPIC extraction ──`);
-  L?.info(`  Tamanho do buffer: ${size} bytes`);
-  L?.info(`  Tamanho de bloco detectado: ${fileBlockSize} bytes`);
+  const fileBlockSize = flatMode ? size : detectBlockSize(topicBuf);
+  const hdrSize       = flatMode ? 0    : BLOCK_HDR;
+
+  L?.head(`── |TOPIC extraction (${flatMode ? 'flat/decompressed' : 'raw'}) ──`);
+  L?.info(`  Buffer: ${size} bytes  blockSize: ${fileBlockSize}  hdrSize: ${hdrSize}`);
   L?.info(`  Frases carregadas: ${phrases.length}`);
-  if (L) L.hex('  Primeiros 64 bytes de |TOPIC', topicBuf, 0, 64);
+  if (L) L.hex('  Primeiros 64 bytes', topicBuf, 0, 64);
 
   const visited    = new Set();
   let   blockStart = 0;
@@ -432,31 +519,37 @@ function extractTopics(topicBuf, phrases, onProgress) {
 
   while (blockStart < size && !visited.has(blockStart)) {
     visited.add(blockStart);
-    if (blockStart + BLOCK_HDR > size) {
+
+    if (!flatMode && blockStart + BLOCK_HDR > size) {
       L?.warn(`  Bloco #${blockNo} em offset ${blockStart}: fora dos limites — interrompendo`);
       break;
     }
 
-    const nextBlockOff  = view.getInt32(blockStart,     true);
-    const lastTopicOff  = view.getInt32(blockStart + 4, true);
-
-    L?.info(`  Bloco #${blockNo} offset=${blockStart}  nextBlock=${nextBlockOff}  lastTopic=${lastTopicOff}`);
+    let nextBlockOff = -1;
+    if (!flatMode) {
+      nextBlockOff = view.getInt32(blockStart,     true);
+      const lastTopicOff = view.getInt32(blockStart + 4, true);
+      L?.info(`  Bloco #${blockNo} offset=${blockStart}  nextBlock=${nextBlockOff}  lastTopic=${lastTopicOff}`);
+    } else {
+      L?.info(`  Flat bloco #${blockNo} offset=${blockStart}`);
+    }
 
     const blockDataEnd = Math.min(blockStart + fileBlockSize, size);
-    let   lpos         = blockStart + BLOCK_HDR;
+    let   lpos         = blockStart + hdrSize;
     let   linksInBlock = 0;
 
     while (lpos + LINK_HDR <= blockDataEnd) {
-      const linkSize = view.getInt32(lpos,     true);
-      const dataLen  = view.getInt32(lpos + 4, true);
-      const prevLink = view.getInt32(lpos + 8, true);
+      const linkSize = view.getInt32(lpos,      true);
+      const dataLen  = view.getInt32(lpos + 4,  true);
+      const prevLink = view.getInt32(lpos + 8,  true);
       const nextLink = view.getInt32(lpos + 12, true);
 
       L?.dim(`    link @${lpos}  linkSize=${linkSize}  dataLen=${dataLen}  prev=${prevLink}  next=${nextLink}`);
 
-      if (linkSize < LINK_HDR || linkSize > fileBlockSize ||
+      const maxLink = flatMode ? size : fileBlockSize;
+      if (linkSize < LINK_HDR || linkSize > maxLink ||
           dataLen  < 1        || dataLen  > linkSize - LINK_HDR) {
-        L?.warn(`    → inválido (linkSize=${linkSize}, dataLen=${dataLen}, LINK_HDR=${LINK_HDR}, fileBlockSize=${fileBlockSize}) — interrompendo bloco`);
+        L?.warn(`    → inválido (linkSize=${linkSize}, dataLen=${dataLen}) — interrompendo bloco`);
         skipped++;
         break;
       }
@@ -502,6 +595,8 @@ function extractTopics(topicBuf, phrases, onProgress) {
 
     L?.info(`  Bloco #${blockNo} encerrado: ${linksInBlock} links, ${topics.length} tópicos até aqui`);
     blockNo++;
+
+    if (flatMode) break;  // entire buffer is one block — done
 
     if (nextBlockOff > blockStart && nextBlockOff < size) {
       blockStart = nextBlockOff;
@@ -632,6 +727,10 @@ function parseHLP(arrayBuffer, onProgress) {
   onProgress(35, 'Lendo metadados…');
   L?.head('── Arquivos internos ──');
 
+  /* Detect WinHelp version: 3.x uses |PhrImage+|PhrIndex; 4.x uses |Phrases */
+  const is3x = fileMap['|PhrImage'] != null && fileMap['|PhrIndex'] != null;
+  L?.info(`Formato detectado: WinHelp ${is3x ? '3.x (Hall compression)' : '4.x'}`);
+
   /* ── |SYSTEM ── */
   let sysInfo = { title: '', version: 0 };
   if (fileMap['|SYSTEM'] != null) {
@@ -645,17 +744,33 @@ function parseHLP(arrayBuffer, onProgress) {
     L?.warn('|SYSTEM não encontrado no diretório');
   }
 
-  /* ── |Phrases ── */
+  /* ── Phrase table ── */
   onProgress(45, 'Lendo tabela de frases…');
   let phrases = [];
-  if (fileMap['|Phrases'] != null) {
+
+  if (is3x) {
+    L?.info(`|PhrIndex offset: ${fileMap['|PhrIndex']}  |PhrImage offset: ${fileMap['|PhrImage']}`);
+    try {
+      const phrIndexR = readInternalFile(r, fileMap['|PhrIndex']);
+      const phrIndex  = parsePhrIndex3x(phrIndexR);
+      if (phrIndex) {
+        L?.ok(`|PhrIndex: ${phrIndex.nPhrases} frases`);
+        const phrImageR = readInternalFile(r, fileMap['|PhrImage']);
+        phrases = parsePhrImage3x(phrImageR, phrIndex);
+        L?.ok(`|PhrImage: ${phrases.length} frases decodificadas`);
+        if (phrases.length > 0) L?.dim(`  Ex. frase[0]="${phrases[0]}"  frase[1]="${phrases[1] || ''}"`);
+      } else {
+        L?.warn('|PhrIndex parse falhou — frases indisponíveis');
+      }
+    } catch (e) { L?.warn(`|PhrIndex/|PhrImage falhou: ${e.message}`); }
+  } else if (fileMap['|Phrases'] != null) {
     L?.info(`|Phrases offset: ${fileMap['|Phrases']}`);
     try {
       phrases = parsePhrases(readInternalFile(r, fileMap['|Phrases']));
       L?.ok(`|Phrases: ${phrases.length} frases carregadas`);
     } catch (e) { L?.warn(`|Phrases falhou: ${e.message}`); }
   } else {
-    L?.info('|Phrases não encontrado (compressão de frases desabilitada)');
+    L?.info('Nenhuma tabela de frases encontrada');
   }
 
   /* ── |TOPIC ── */
@@ -686,7 +801,17 @@ function parseHLP(arrayBuffer, onProgress) {
       } else {
         if (L) L.hex('|TOPIC primeiros 64 bytes de dados', arrayBuffer, topicOff + 8, 64);
         const topicBuf = arrayBuffer.slice(topicOff + 8, topicOff + 8 + safeSize);
-        topics = extractTopics(topicBuf, phrases, onProgress);
+
+        if (is3x) {
+          L?.info('WinHelp 3.x: descomprimindo blocos Hall LZ77…');
+          onProgress(60, 'Descomprimindo tópicos 3.x…');
+          const decompBuf = decompressTopicBlocks3x(topicBuf, L);
+          L?.ok(`Descompressão concluída: ${decompBuf.byteLength} bytes`);
+          if (L) L.hex('Primeiros 64 bytes descomprimidos', decompBuf, 0, 64);
+          topics = extractTopics(decompBuf, phrases, onProgress, true /* flatMode */);
+        } else {
+          topics = extractTopics(topicBuf, phrases, onProgress, false);
+        }
       }
     } catch (e) {
       L?.error(`Exceção em |TOPIC: ${e.message}`);
